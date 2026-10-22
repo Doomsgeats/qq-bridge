@@ -2242,6 +2242,12 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // 回合判忙租约：v0.1.7 的 isConversationBusyV2 只问「两张表里有没有这个会话」，
+  // 而 turn/end 一旦丢了（断线时 DSH 已经收摊、或重连快照里只剩 turn/start），
+  // 这两张表就永远清不掉 ⇒ 该会话永久判忙 ⇒ 之后每条消息都只进「会话繁忙，暂存」，
+  // QQ 上表现就是「她不回话了」。0.2.0 已改成「起始时间 + 租约」，这里把同样的判据回移。
+  const TURN_BUSY_LEASE_MS = 3 * 60 * 1000;
+  const turnLeaseNoted = new Set(); // sessionId：租约过期的日志只打一次，新回合开始时清掉
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -2369,6 +2375,10 @@ async function main() {
     }
     if (!restored) return;
     collectors.set(sessionId, collector);
+    // 恢复出来的回合必须带起始时间，否则租约无从生效（v0.1.7 里 v2TurnStartAt 只在
+    // live turn/start 时写，这条路永远走不到）。不知道真实起点时按现在算：活着的回合
+    // 会在 turn/end 清掉，真丢了的回合最多再忙一个租约期就自动解除。
+    if (!v2TurnStartAt.has(sessionId)) v2TurnStartAt.set(sessionId, Date.now());
     log(`重连后恢复了进行中的回合（${sessionId}，turn ${[...open].join(',')}）`);
   }
 
@@ -9474,7 +9484,18 @@ async function main() {
     const q = promptQueues.get(key);
     if (q && (q.running || q.queue.length > 0)) return true;
     const sid = state.sessions[key];
-    if (sid && (v2TurnStartAt.has(sid) || collectors.has(sid))) return true;
+    if (!sid) return false;
+    // 只按「起始时间 + 租约」判忙，不再只看表里有没有键：
+    //   · 有 collector 但没起始时间（杂散事件重建出来的）→ 无法证明还活着，不判忙；
+    //   · 起始时间超过租约（turn/end 丢了 / DSH 重启把回合丢了）→ 不判忙。
+    // collector 保留，所以万一回合其实还活着，它的回复仍会被 flush，只是允许新唤醒排队。
+    const startedAt = Number(v2TurnStartAt.get(sid));
+    if (!Number.isFinite(startedAt) || startedAt <= 0) return false;
+    if (Date.now() - startedAt < TURN_BUSY_LEASE_MS) return true;
+    if (collectors.has(sid) && !turnLeaseNoted.has(sid)) {
+      turnLeaseNoted.add(sid);
+      log(`[reserved2] 回合判忙租约已过期（${sid}，起始 ${Math.round((Date.now() - startedAt) / 60000)} 分钟前），解除忙碌；collector 保留，迟到回复仍会 flush`);
+    }
     return false;
   }
 
@@ -10212,6 +10233,7 @@ async function main() {
               sendToolSucceededSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
+              turnLeaseNoted.delete(frame.sessionId);
             }
             if (frame.event.type === 'tool/call') {
               const toolName = String(frame.event.data?.name ?? '');
